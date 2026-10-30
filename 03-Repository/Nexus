@@ -1,0 +1,4 @@
+# Nexus
+In this Nexus Repository setup, Traefik acts as a reverse proxy and HTTPS gateway in front of Nexus. users get access Nexus securely through domain without exposing Nexus's port 8081 directly to the internet.
+
+<img width="645" height="384" alt="image" src="https://github.com/user-attachments/assets/aebb95cb-3393-456e-b61d-86feb70454b0" />
