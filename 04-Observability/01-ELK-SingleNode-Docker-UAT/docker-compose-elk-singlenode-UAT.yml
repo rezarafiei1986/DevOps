@@ -1,0 +1,190 @@
+# Docker Compose configuration for the monitoring stack.
+# check config file: docker compose -f docker-compose-elk-singlenode-UAT.yml config
+# pull images: docker compose -f docker-compose-elk-singlenode-UAT.yml pull
+# Start: docker compose -f docker-compose-elk-singlenode-UAT.yml up -d
+# Check status: docker compose -f docker-compose-elk-singlenode-UAT.yml ps
+# View logs: docker compose -f docker-compose-elk-singlenode-UAT.yml logs -f <service>
+#
+# SECURITY WARNING:
+# Elasticsearch security is disabled and Grafana uses admin/admin.
+# Use only in a trusted development environment unless access is secured.
+# Published ports may be reachable from other machines.
+
+name: monitoring
+
+services:
+
+  ######################################################################
+  # Redis cache / key-value store.
+  redisserver:
+    image: redis:latest
+    ports:
+      - "6379:6379" # Host port : container port
+    networks:
+      cache:
+        aliases:
+          - "redis" # Other containers on this network can use hostname "redis".
+
+  ######################################################################
+  # Web interface for inspecting Redis.
+  redisinsight:
+    image: redis/redisinsight:latest
+    ports:
+      - "5540:5540" # RedisInsight web UI
+    networks:
+      cache:
+        aliases:
+          - "redisinsight"
+
+  ######################################################################
+  # Search and storage engine for logs and trace data.
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: elasticsearch
+    environment:
+      - node.name=elasticsearch
+      - discovery.type=single-node # Run Elasticsearch as a single node.
+      - bootstrap.memory_lock=true # Request memory locking where supported.
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m" # Fixed 512 MB JVM heap.
+      - xpack.security.enabled=false # Development only: disables Elasticsearch security.
+      - xpack.security.http.ssl.enabled=false # Use plain HTTP, not HTTPS.
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - esdata1:/usr/share/elasticsearch/data # Persist indexes across container recreation.
+    ports:
+      - "9200:9200" # Elasticsearch HTTP API.
+      # - "9300:9300" # Optional transport port; usually unnecessary to publish for one node.
+    healthcheck:
+      # Check that the Elasticsearch HTTP API responds successfully.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/ >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+    networks:
+      logging:
+        aliases:
+          - "elasticsearch"
+
+  ######################################################################
+  # Web UI for searching and exploring Elasticsearch data.
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.0
+    container_name: kibana
+    environment:
+      # Use the HTTP API port 9200, not transport port 9300.
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+    ports:
+      - "5601:5601" # Kibana web UI
+    depends_on:
+      elasticsearch:
+        condition: service_healthy # Wait for Elasticsearch's health check.
+    networks:
+      logging:
+        aliases:
+          - "kibana"
+  ######################################################################
+  # Receives, transforms, and forwards log events.
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.13.0
+    container_name: logstash
+    command: >
+      logstash -f /etc/logstash/conf.d/logstash.conf
+    volumes:
+      # Ensure ./config/logstash.conf exists on the host.
+      # :Z sets an SELinux private label on supported hosts.
+      - ./config:/etc/logstash/conf.d:Z
+    ports:
+      - "5010:5000" # Host port 5010 -> container port 5000.
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      logging:
+        aliases:
+          - "logstash"
+
+  ######################################################################
+  # Distributed tracing collector and UI.
+  zipkin:
+    image: openzipkin/zipkin
+    container_name: zipkin
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - STORAGE_TYPE=elasticsearch # Store traces in Elasticsearch.
+      - "ES_HOSTS=http://elasticsearch:9200" # Elasticsearch HTTP endpoint.
+      - JAVA_OPTS=-Xms256m -Xmx512m # Zipkin JVM heap settings.
+    ports:
+      - "9411:9411" # Zipkin UI and collector API.
+    healthcheck:
+      # Check loopback directly to avoid ambiguous DNS on multiple networks.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9411/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    networks:
+      tracing:
+        aliases:
+          - "zipkin"
+      logging:
+        aliases:
+          - "zipkin"
+
+  ######################################################################
+  # Collects and stores metrics as time series.
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090" # Prometheus web UI.
+    volumes:
+      # Ensure ./prometheus contains a valid Prometheus configuration file.
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    container_name: prometheus
+    networks:
+      monitoring:
+        aliases:
+          - "prometheus"
+
+  ######################################################################
+  # Creates dashboards and visualizations for metrics.
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000" # Grafana web UI.
+    volumes:
+      - grafana-storage:/var/lib/grafana # Persist Grafana dashboards and settings.
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin # Change before exposing beyond a trusted network.
+    container_name: grafana
+    networks:
+      monitoring:
+        aliases:
+          - "grafana"
+
+######################################################################
+# Named volumes preserve data when containers are recreated.
+volumes:
+  esdata1:
+    driver: local
+  grafana-storage:
+    driver: local
+
+######################################################################
+# Bridge networks group services by function.
+# Containers can communicate directly when they share a network.
+networks:
+  logging:
+    driver: bridge
+  cache:
+    driver: bridge
+  monitoring:
+    driver: bridge
+  tracing:
+    driver: bridge
